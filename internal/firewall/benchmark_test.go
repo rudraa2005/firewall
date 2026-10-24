@@ -207,7 +207,7 @@ func newBenchmarkServer(b *testing.B, handler http.HandlerFunc) *Server {
 	if err != nil {
 		b.Fatalf("failed to create server: %v", err)
 	}
-	server.proxy.Transport = handlerRoundTripper{handler: handler}
+	server.SetUpstreamTransport(handlerRoundTripper{handler: handler})
 	server.logger.SetOutput(io.Discard)
 	b.Cleanup(server.Close)
 	return server

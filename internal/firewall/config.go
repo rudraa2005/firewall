@@ -25,6 +25,22 @@ type Config struct {
 	CanarySampleRate     float64
 	NormalizationDepth   int
 	DeepNormalization    int
+
+	// Redis (optional). When set, all mutable state is stored in Redis so
+	// multiple firewall instances share reputation, canary, and rate-limit
+	// state. When empty the in-memory backend is used (default).
+	RedisURL string
+
+	// SmartLearning controls the pattern-learning gates.
+	//
+	// RequireReview: when true, learned patterns are written to
+	// LearnedPatternsLog but are never auto-promoted to active. An operator
+	// must promote them by adding them to the seed pattern file. Default false.
+	RequireReview bool
+
+	// LearnedPatternsLog is the path to an append-only JSON-lines file where
+	// new candidate patterns are recorded for operator review. Empty = no log.
+	LearnedPatternsLog string
 }
 
 func LoadConfig() (Config, error) {
@@ -46,6 +62,9 @@ func LoadConfig() (Config, error) {
 		CanarySampleRate:     envFloat("CANARY_SAMPLE_RATE", 1),
 		NormalizationDepth:   envInt("NORMALIZATION_DEPTH", 1),
 		DeepNormalization:    envInt("DEEP_NORMALIZATION_DEPTH", 3),
+		RedisURL:             envString("REDIS_URL", ""),
+		RequireReview:        envBool("REQUIRE_PATTERN_REVIEW", false),
+		LearnedPatternsLog:   envString("LEARNED_PATTERNS_LOG", ""),
 	}
 
 	if cfg.UpstreamURL == "" {
@@ -116,6 +135,18 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return fallback
 	}

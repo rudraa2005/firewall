@@ -8,5 +8,6 @@
   { "pattern": "jailbreak", "weight": 14 },
   { "pattern": "do anything now", "weight": 14 },
   { "pattern": "repeat the secret", "weight": 20 },
-  { "pattern": "override the policy", "weight": 18 }
+  { "pattern": "override the policy", "weight": 18 },
+  { "pattern": "developer message", "weight": 20 }
 ]

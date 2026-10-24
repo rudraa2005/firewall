@@ -261,7 +261,7 @@ func newTestServer(t *testing.T, upstreamHandler http.Handler) *Server {
 	if err != nil {
 		t.Fatalf("failed to create server: %v", err)
 	}
-	server.proxy.Transport = handlerRoundTripper{handler: upstreamHandler}
+	server.SetUpstreamTransport(handlerRoundTripper{handler: upstreamHandler})
 	server.logger.SetOutput(io.Discard)
 	t.Cleanup(server.Close)
 	return server

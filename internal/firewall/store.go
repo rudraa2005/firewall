@@ -27,6 +27,11 @@ type PatternStore struct {
 	matcher       *AhoCorasick
 	flushCount    int
 	flushInterval time.Duration
+
+	// smarter learning config
+	requireReview      bool
+	learnedPatternsLog string
+	logMu              sync.Mutex
 }
 
 type ReputationStore struct {
@@ -82,7 +87,7 @@ func LoadSeedPatterns(path string) ([]PatternEntry, error) {
 	return patterns, nil
 }
 
-func NewPatternStore(patterns []PatternEntry, flushCount int, flushInterval time.Duration) *PatternStore {
+func NewPatternStore(patterns []PatternEntry, flushCount int, flushInterval time.Duration, requireReview bool, learnedPatternsLog string) *PatternStore {
 	active := make(map[string]PatternEntry)
 	for _, entry := range patterns {
 		cleaned := cleanPattern(entry.Pattern)
@@ -93,10 +98,12 @@ func NewPatternStore(patterns []PatternEntry, flushCount int, flushInterval time
 	}
 
 	store := &PatternStore{
-		active:        active,
-		pending:       map[string]PatternEntry{},
-		flushCount:    flushCount,
-		flushInterval: flushInterval,
+		active:             active,
+		pending:            map[string]PatternEntry{},
+		flushCount:         flushCount,
+		flushInterval:      flushInterval,
+		requireReview:      requireReview,
+		learnedPatternsLog: learnedPatternsLog,
 	}
 	store.rebuildLocked()
 	return store
@@ -124,9 +131,37 @@ func (s *PatternStore) Scan(text string) ScanResult {
 	return matcher.Scan(text)
 }
 
+// Queue adds a candidate learned pattern. Three gates are applied before the
+// pattern enters the pending set:
+//
+//  1. Minimum specificity: at least 3 words and 15 characters.
+//  2. Benign corpus check: reject if the fragment is ≥50% Jaccard-similar to
+//     any phrase in the built-in benign corpus.
+//  3. Duplicate check: skip if already active.
+//
+// If RequireReview is enabled the pattern is logged to LearnedPatternsLog but
+// never promoted to active — an operator must promote it manually.
 func (s *PatternStore) Queue(pattern string, weight float64) {
 	cleaned := cleanPattern(pattern)
 	if cleaned == "" {
+		return
+	}
+
+	// Gate 1: minimum specificity.
+	if !meetsSpecificity(cleaned) {
+		return
+	}
+
+	// Gate 2: benign corpus check.
+	if matchesBenignCorpus(cleaned) {
+		return
+	}
+
+	// Log for operator review regardless of requireReview flag.
+	s.appendLearnedLog(cleaned, weight)
+
+	if s.requireReview {
+		// In review mode, patterns are never auto-promoted.
 		return
 	}
 
@@ -179,6 +214,116 @@ func (s *PatternStore) rebuildLocked() {
 		patterns = append(patterns, entry)
 	}
 	s.matcher = NewAhoCorasick(patterns)
+}
+
+// appendLearnedLog appends the pattern to the configured log file (JSON-lines).
+// Errors are silently ignored — the log is best-effort.
+func (s *PatternStore) appendLearnedLog(pattern string, weight float64) {
+	if s.learnedPatternsLog == "" {
+		return
+	}
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+
+	f, err := os.OpenFile(s.learnedPatternsLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	type logEntry struct {
+		Pattern   string    `json:"pattern"`
+		Weight    float64   `json:"weight"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+	line, err := json.Marshal(logEntry{Pattern: pattern, Weight: weight, Timestamp: time.Now().UTC()})
+	if err != nil {
+		return
+	}
+	_, _ = f.Write(append(line, '\n'))
+}
+
+// meetsSpecificity returns true only if the pattern has at least 3 words and
+// at least 15 characters. Single-word or very short patterns are too generic
+// and risk false positives.
+func meetsSpecificity(pattern string) bool {
+	const (
+		minWords  = 3
+		minLength = 15
+	)
+	if len(pattern) < minLength {
+		return false
+	}
+	words := strings.Fields(pattern)
+	return len(words) >= minWords
+}
+
+// benignCorpus is a small set of representative benign phrases. Any learned
+// pattern with Jaccard word-set similarity ≥ 0.5 against any of these is
+// rejected to avoid learning patterns that would false-positive on normal use.
+var benignCorpus = []string{
+	"summarize zero trust networking",
+	"write a go function",
+	"what is the capital",
+	"write a short story",
+	"explain the pythagorean theorem",
+	"translate hello world",
+	"give me a recipe",
+	"explain how rest apis work",
+	"list five countries",
+	"why does my program panic",
+	"draft a professional email",
+	"what does ephemeral mean",
+	"write a haiku about",
+	"write a sql query",
+	"explain mutual tls",
+	"write a product summary",
+	"summarize network firewalls",
+	"write a poem about",
+	"give me three tips",
+	"tell me a short story",
+	"write a function that reverses",
+	"what is the best way",
+	"how do i use",
+}
+
+// matchesBenignCorpus returns true if the pattern is too similar to a known
+// benign phrase (Jaccard word-set similarity ≥ 0.5).
+func matchesBenignCorpus(pattern string) bool {
+	pWords := wordSet(pattern)
+	for _, phrase := range benignCorpus {
+		if jaccardSimilarity(pWords, wordSet(phrase)) >= 0.5 {
+			return true
+		}
+	}
+	return false
+}
+
+// wordSet returns the set of lowercase words in s.
+func wordSet(s string) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, w := range strings.Fields(strings.ToLower(s)) {
+		set[w] = struct{}{}
+	}
+	return set
+}
+
+// jaccardSimilarity returns |A∩B| / |A∪B|.
+func jaccardSimilarity(a, b map[string]struct{}) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 1.0
+	}
+	intersection := 0
+	for w := range a {
+		if _, ok := b[w]; ok {
+			intersection++
+		}
+	}
+	union := len(a) + len(b) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
 }
 
 func NewReputationStore(halfLife time.Duration) *ReputationStore {
@@ -334,5 +479,6 @@ func defaultPatterns() []PatternEntry {
 		{Pattern: "do anything now", Weight: 14},
 		{Pattern: "repeat the secret", Weight: 20},
 		{Pattern: "override the policy", Weight: 18},
+		{Pattern: "developer message", Weight: 20},
 	}
 }
